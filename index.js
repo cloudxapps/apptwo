@@ -129,3 +129,36 @@ exports.handler = async (input) => {
 };
 ============================================
 
+exports.handler = async (input) => {
+
+    try {
+
+        // Hardcoded JSON string
+        const result = JSON.stringify({
+            agentName: "John Smith",
+            agentId: "12345",
+            sessionId: "CB-987654",
+            sessionStartTime: "2026-09-01T10:00:00Z",
+            sessionEndTime: "2026-09-01T10:15:30Z",
+            duration: 930
+        });
+
+        return {
+            success: true,
+            message: "Success",
+            result: result,
+            error: ""
+        };
+
+    } catch (error) {
+
+        return {
+            success: false,
+            message: "Failed",
+            result: "",
+            error: error.message || "Unknown error"
+        };
+    }
+};
+==========================
+
