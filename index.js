@@ -43,3 +43,6 @@ exports.handler = async (input) => {
         };
     }
 };
+
+Compress-Archive -Path .\index.js -DestinationPath .\function.zip -Force
+
