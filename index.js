@@ -162,3 +162,20 @@ exports.handler = async (input) => {
 };
 ==========================
 
+const variables = ["NA", "NA", "NA", "NA", "NA"];
+
+let index = 0;
+
+for (const data of sessionData) {
+    if (index < 5) {
+        variables[index] = data;
+    }
+    index++;
+}
+
+return variables;
+
+["data1", "data2", "data3", "NA", "NA"]
+["data1", "data2", "NA", "NA", "NA"]
+["data1", "data2", "data3", "data4", "data5"]
+
