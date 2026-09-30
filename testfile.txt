@@ -1,1 +1,255 @@
 
+'use strict';
+
+// ---- Genesys Cloud OAuth (Client Credentials) - fill these in ----
+const GC_CLIENT_ID = 'PASTE_CLIENT_ID_HERE';
+const GC_CLIENT_SECRET = 'PASTE_CLIENT_SECRET_HERE';
+const GC_REGION = 'mypurecloud.com'; // e.g. usw2.pure.cloud, mypurecloud.ie, aps1.pure.cloud
+// -------------------------------------------------------------------
+
+const TRACE_WINDOW_MIN = 60; // how far back to search SIP traces (minutes)
+
+// SIP codes treated as failures. Use exact codes ('487') or classes ('5xx' = 500-599).
+// Examples: ['487', '480', '500']  or  ['480', '487', '5xx']
+const TARGET_SIP_CODES = ['4xx', '5xx', '6xx'];
+
+// SIP codes never treated as failures (401/407 are normal authentication challenges)
+const IGNORE_SIP_CODES = ['401', '407'];
+
+// Duplicate protection: ID of a Genesys data table used to remember which
+// conversations were already reported (Admin > Architect > Data Tables).
+// Leave '' to turn duplicate protection off.
+const DEDUP_DATATABLE_ID = 'bcc6d769-e23f-43cf-8db3-b059b155d2dd';
+
+function isFailureCode(code) {
+  if (!/^\d{3}$/.test(code) || IGNORE_SIP_CODES.includes(code)) return false;
+  return TARGET_SIP_CODES.some((p) => {
+    const pat = String(p).toLowerCase();
+    return /^\dxx$/.test(pat) ? code[0] === pat[0] : code === pat;
+  });
+}
+
+function getConfig() {
+  return {
+    clientId: GC_CLIENT_ID,
+    clientSecret: GC_CLIENT_SECRET,
+    region: GC_REGION,
+  };
+}
+
+async function getToken(cfg) {
+  const basic = Buffer.from(`${cfg.clientId}:${cfg.clientSecret}`).toString('base64');
+  const res = await fetch(`https://login.${cfg.region}/oauth/token`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${basic}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials',
+  });
+  if (!res.ok) throw new Error(`OAuth failed: HTTP ${res.status}`);
+  return (await res.json()).access_token;
+}
+
+async function apiGet(cfg, token, path) {
+  const res = await fetch(`https://api.${cfg.region}${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`GET ${path.split('?')[0]} failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+const stripTel = (v) => String(v || '').replace(/^tel:|^sip:/i, '').split('@')[0].split(';')[0];
+
+// Compare phone numbers on their last 10 digits ("tel:+13135551234" == "3135551234")
+const last10 = (v) => stripTel(v).replace(/\D/g, '').slice(-10);
+const sameNumber = (a, b) => last10(a) !== '' && last10(a) === last10(b);
+
+/**
+ * Claim this conversation in the data table. Only the first run for a
+ * conversation succeeds; later runs find the row already there.
+ * Returns true = first report (send the email), false = already reported.
+ */
+async function claimFirstReport(cfg, token, conversationId, codes) {
+  if (!DEDUP_DATATABLE_ID || DEDUP_DATATABLE_ID.startsWith('PASTE_')) return true;
+  const base = `https://api.${cfg.region}/api/v2/flows/datatables/${encodeURIComponent(DEDUP_DATATABLE_ID)}/rows`;
+  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+
+  const res = await fetch(base, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ key: conversationId, method: codes, reportedAt: new Date().toISOString() }),
+  });
+  if (res.ok) return true;
+
+  // Insert failed: if the row already exists, another run reported this conversation.
+  const check = await fetch(`${base}/${encodeURIComponent(conversationId)}`, { headers });
+  if (check.ok) return false;
+  throw new Error(`Data table insert failed: HTTP ${res.status}`);
+}
+
+async function searchSipTraces(cfg, token, conversationId) {
+  const to = new Date();
+  const from = new Date(to.getTime() - TRACE_WINDOW_MIN * 60 * 1000);
+  const path = `/api/v2/telephony/siptraces?dateStart=${encodeURIComponent(from.toISOString())}`
+    + `&dateEnd=${encodeURIComponent(to.toISOString())}`
+    + `&conversationId=${encodeURIComponent(conversationId)}`;
+
+  const body = await apiGet(cfg, token, path);
+  const rows = Array.isArray(body) ? body : (body && (body.data || body.entities)) || [];
+  return rows;
+}
+
+/** Find SIP failure responses (e.g. 487, 480, 500) in the trace rows. */
+function analyzeTraces(rows, ani, dnis) {
+  const r = {
+    matched: false,
+    matchedCodes: new Set(),
+    hasCancel: false,
+    fromUser: '',
+    toUser: '',
+    firstFrom: '',
+    firstTo: '',
+  };
+  for (const m of rows) {
+    const method = String(m.method || '').trim();
+    r.firstFrom = r.firstFrom || m.fromUser || '';
+    r.firstTo = r.firstTo || m.toUser || '';
+    if (method.toUpperCase() === 'CANCEL') r.hasCancel = true;
+    // If ANI / DNIS were passed in, only count failures on the SIP leg from that ANI / to that DNIS
+    const aniMatches = !ani || sameNumber(ani, m.fromUser);
+    const dnisMatches = !dnis || sameNumber(dnis, m.toUser);
+    if (isFailureCode(method) && aniMatches && dnisMatches) {
+      r.matched = true;
+      r.matchedCodes.add(method);
+      r.fromUser = r.fromUser || m.fromUser || '';
+      r.toUser = r.toUser || m.toUser || '';
+    }
+  }
+  return r;
+}
+
+const SIP_TEXT = {
+  400: 'Bad Request', 403: 'Forbidden', 404: 'Not Found', 408: 'Request Timeout',
+  480: 'Temporarily Unavailable', 481: 'Call Does Not Exist', 484: 'Address Incomplete',
+  486: 'Busy Here', 487: 'Request Terminated', 488: 'Not Acceptable Here',
+  500: 'Server Internal Error', 502: 'Bad Gateway', 503: 'Service Unavailable',
+  504: 'Server Time-out', 603: 'Decline',
+};
+const describe = (c) => (SIP_TEXT[c] ? `${c} ${SIP_TEXT[c]}` : String(c));
+
+/** Runs the SIP trace check for one conversation. */
+async function checkConversation(event, context) {
+  const conversationId = event && event.conversationId;
+  const out = {
+    conversationId: conversationId || '',
+    traceFound: false,
+    matchedCodes: '',
+    duplicate: false,
+    hasCancel: false,
+    ani: '',
+    dnis: '',
+    error: '',
+  };
+
+  try {
+    if (!conversationId) throw new Error('conversationId is required');
+    const cfg = getConfig();
+    if (!cfg.clientId || cfg.clientId.startsWith('PASTE_') || !cfg.clientSecret || cfg.clientSecret.startsWith('PASTE_')) {
+      throw new Error('GC_CLIENT_ID / GC_CLIENT_SECRET not set in index.js');
+    }
+
+    const token = await getToken(cfg);
+    const rows = await searchSipTraces(cfg, token, conversationId);
+    out.traceFound = rows.length > 0;
+
+    const t = analyzeTraces(rows, event.ani, event.dnis);
+    Object.assign(out, {
+      matchedCodes: [...t.matchedCodes].join(','),
+      hasCancel: t.hasCancel,
+      ani: t.fromUser || t.firstFrom,
+      dnis: t.toUser || t.firstTo,
+    });
+
+    // Only the first run for this conversation reports the failure
+    if (out.matchedCodes) {
+      const first = await claimFirstReport(cfg, token, conversationId, out.matchedCodes);
+      if (!first) {
+        out.duplicate = true;
+        out.matchedCodes = '';
+      }
+    }
+  } catch (err) {
+    out.error = String(err && err.message ? err.message : err);
+  }
+  return out;
+}
+
+const cleanNum = (v) => stripTel(v);
+
+/** Human-readable result, e.g. "SIP failure: 487 Request Terminated" */
+function buildMessage(r) {
+  if (r.error) return `Check failed: ${r.error}`;
+  if (!r.traceFound) return 'No SIP trace found for this call';
+  if (r.duplicate) return 'Already reported for this conversation';
+  if (!r.matchedCodes) return 'No failure';
+  const codes = r.matchedCodes.split(',').map(describe).join(', ');
+  return `SIP failure: ${codes}${r.hasCancel ? ' (CANCEL seen)' : ''}`;
+}
+
+/** Function entry point: returns connid, method, ani, dnis, traceFound, message. */
+exports.handler = async (event, context) => {
+  const r = await checkConversation(event, context);
+  if (r.error) console.error(`Trunk Monitoring error for ${r.conversationId}: ${r.error}`);
+  return {
+    connid: r.conversationId,
+    method: r.matchedCodes,
+    ani: cleanNum(r.ani),
+    dnis: cleanNum(r.dnis),
+    traceFound: r.traceFound,
+    message: buildMessage(r),
+  };
+};
+
+
+==============================================================================
+ INPUT CONTRACT
+==============================================================================
+
+{
+  "title": "Trunk Monitoring input",
+  "type": "object",
+  "required": ["conversationId"],
+  "properties": {
+    "conversationId": {
+      "type": "string",
+      "description": "Conversation ID passed from the trigger / workflow"
+    },
+    "ani": {
+      "type": "string",
+      "description": "Optional. Calling number of this call (from the trigger). When set, only failures on the SIP leg from this ANI are reported."
+    },
+    "dnis": {
+      "type": "string",
+      "description": "Optional. Called number of this call (from the trigger). When set, only failures on the SIP leg to this DNIS are reported."
+    }
+  }
+}
+
+==============================================================================
+ OUTPUT CONTRACT
+==============================================================================
+
+{
+  "title": "Trunk Monitoring output",
+  "type": "object",
+  "properties": {
+    "connid": { "type": "string", "description": "Genesys conversation ID" },
+    "method": { "type": "string", "description": "SIP failure code(s) found, e.g. 487 or 480,500. Empty = no failure" },
+    "ani": { "type": "string", "description": "Calling number" },
+    "dnis": { "type": "string", "description": "Called number" },
+    "traceFound": { "type": "boolean", "description": "true = SIP trace found for this call, false = no SIP trace found" },
+    "message": { "type": "string", "description": "Result text, e.g. 'SIP failure: 487 Request Terminated' or 'No failure'" }
+  }
+}
