@@ -21,6 +21,9 @@ const IGNORE_SIP_CODES = ['401', '407'];
 // Leave '' to turn duplicate protection off.
 const DEDUP_DATATABLE_ID = 'bcc6d769-e23f-43cf-8db3-b059b155d2dd';
 
+// Rows older than this are deleted automatically (minutes).
+const DEDUP_KEEP_MIN = 60;
+
 function isFailureCode(code) {
   if (!/^\d{3}$/.test(code) || IGNORE_SIP_CODES.includes(code)) return false;
   return TARGET_SIP_CODES.some((p) => {
@@ -81,12 +84,43 @@ async function claimFirstReport(cfg, token, conversationId, codes) {
     headers,
     body: JSON.stringify({ key: conversationId, method: codes, reportedAt: new Date().toISOString() }),
   });
-  if (res.ok) return true;
+  if (res.ok) {
+    await cleanupOldRows(base, headers);
+    return true;
+  }
 
   // Insert failed: if the row already exists, another run reported this conversation.
   const check = await fetch(`${base}/${encodeURIComponent(conversationId)}`, { headers });
   if (check.ok) return false;
   throw new Error(`Data table insert failed: HTTP ${res.status}`);
+}
+
+/**
+ * Delete data table rows older than DEDUP_KEEP_MIN minutes.
+ * Runs only when a new failure is recorded. Cleanup problems are logged
+ * but never stop the alert.
+ */
+async function cleanupOldRows(base, headers) {
+  try {
+    const cutoff = Date.now() - DEDUP_KEEP_MIN * 60 * 1000;
+    const oldKeys = [];
+    for (let page = 1; page <= 10; page++) {
+      const res = await fetch(`${base}?pageSize=500&pageNumber=${page}&showbrief=false`, { headers });
+      if (!res.ok) throw new Error(`list rows failed: HTTP ${res.status}`);
+      const body = await res.json();
+      for (const row of body.entities || []) {
+        const t = Date.parse(row.reportedAt);
+        if (row.key && !Number.isNaN(t) && t < cutoff) oldKeys.push(row.key);
+      }
+      if (!body.pageCount || page >= body.pageCount) break;
+    }
+    for (const key of oldKeys) {
+      const del = await fetch(`${base}/${encodeURIComponent(key)}`, { method: 'DELETE', headers });
+      if (!del.ok) throw new Error(`delete row failed: HTTP ${del.status}`);
+    }
+  } catch (err) {
+    console.error(`Trunk Monitoring cleanup skipped: ${err.message}`);
+  }
 }
 
 async function searchSipTraces(cfg, token, conversationId) {
