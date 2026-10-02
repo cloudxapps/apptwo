@@ -1,1 +1,129 @@
+// Genesys Cloud Function Data Action
+// Sends only ONE alert per conversationId, using a Data Table as the dedupe store.
+// Input (Architect): conversationId, dataTableId
+// Output: { sendAlert: boolean, reason: string }
+// Runtime: nodejs24.x   Handler: index.handler
+
+const REGION = 'aps1.pure.cloud';
+const CLIENT_ID = 'YOUR_CLIENT_ID';
+const CLIENT_SECRET = 'YOUR_CLIENT_SECRET';
+
+const ROW_TTL_MS = 60 * 60 * 1000;      // delete rows older than 1 hour
+const CLEANUP_EVERY_MS = 5 * 60 * 1000; // cleanup at most every 5 min per table
+const MAX_DELETES = 50;                 // keep each run fast
+
+// Cached while the container stays warm
+let cachedToken = null;
+let tokenExpiresAt = 0;
+const lastCleanupAt = {}; // per data table
+
+async function getToken() {
+  if (cachedToken && Date.now() < tokenExpiresAt) return cachedToken;
+
+  const res = await fetch(`https://login.${REGION}/oauth/token`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Authorization: 'Basic ' + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64'),
+    },
+    body: 'grant_type=client_credentials',
+  });
+  if (!res.ok) throw new Error(`OAuth failed: ${res.status}`);
+
+  const data = await res.json();
+  cachedToken = data.access_token;
+  tokenExpiresAt = Date.now() + ((data.expires_in || 3600) - 60) * 1000;
+  return cachedToken;
+}
+
+async function cleanupExpiredRows(rowsUrl, tableId, headers) {
+  if (Date.now() - (lastCleanupAt[tableId] || 0) < CLEANUP_EVERY_MS) return 0;
+  lastCleanupAt[tableId] = Date.now();
+
+  const cutoff = Date.now() - ROW_TTL_MS;
+  const expiredKeys = [];
+
+  for (let page = 1, pages = 1; page <= pages && expiredKeys.length < MAX_DELETES; page++) {
+    const res = await fetch(`${rowsUrl}?pageNumber=${page}&pageSize=500&showbrief=false`, { headers });
+    if (!res.ok) break;
+
+    const data = await res.json();
+    pages = data.pageCount || 1;
+
+    for (const row of data.entities || []) {
+      // Invalid/missing CreatedAt gives NaN, so the check below also treats it as expired
+      if (!(Date.parse(row.CreatedAt) >= cutoff)) expiredKeys.push(row.key);
+      if (expiredKeys.length >= MAX_DELETES) break;
+    }
+  }
+
+  const results = await Promise.all(
+    expiredKeys.map((key) =>
+      fetch(`${rowsUrl}/${encodeURIComponent(key)}`, { method: 'DELETE', headers })
+    )
+  );
+  return results.filter((r) => r.ok).length;
+}
+
+exports.handler = async (event) => {
+  const { conversationId, dataTableId } = event || {};
+
+  if (!conversationId) return { sendAlert: false, reason: 'missing conversationId' };
+  if (!dataTableId) return { sendAlert: false, reason: 'missing dataTableId' };
+
+  const rowsUrl = `https://api.${REGION}/api/v2/flows/datatables/${encodeURIComponent(dataTableId)}/rows`;
+  let headers;
+  let result;
+
+  
+  try {
+    headers = { Authorization: `Bearer ${await getToken()}` };
+
+    // Insert fails if the key already exists, so parallel events are safe
+    const res = await fetch(rowsUrl, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: conversationId, CreatedAt: new Date().toISOString() }),
+    });
+
+    if (res.ok) {
+      result = { sendAlert: true, reason: 'first alert for this conversation' };
+    } else {
+      const text = await res.text();
+      result = res.status === 409 || /conflict|duplicate|already exists/i.test(text)
+        ? { sendAlert: false, reason: 'already alerted' }
+        // Any other error: fail open so a real alert is not missed
+        : { sendAlert: true, reason: `dedupe check failed (${res.status}): ${text.slice(0, 200)}` };
+    }
+  } catch (err) {
+    return { sendAlert: true, reason: `dedupe check error: ${err.message}` };
+  }
+
+  // Cleanup never affects the alert decision
+  try {
+    const deleted = await cleanupExpiredRows(rowsUrl, dataTableId, headers);
+    if (deleted) result.reason += `; cleaned ${deleted} old rows`;
+  } catch (_) { /* ignore cleanup errors */ }
+
+  return result;
+};
+
+
+
+
+
+
+const { handler } = require('./index');
+
+const conversationId = process.argv[2] || 'test-conv-001';
+const dataTableId = process.argv[3] || 'YOUR-DATA-TABLE-ID';
+
+handler({ conversationId, dataTableId }).then((result) => {
+  console.log('Input :', { conversationId, dataTableId });
+  console.log('Output:', result);
+});
+
+
+cd C:\path\to\your\folder
+node test.js conv-001 YOUR-DATA-TABLE-ID
 
