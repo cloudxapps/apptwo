@@ -1,30 +1,24 @@
-// Genesys Cloud Function Data Action
-// Sends only ONE alert per conversationId, using a Data Table as the dedupe store.
-// Input (Architect): conversationId, dataTableId
-// Output: { sendAlert: boolean, reason: string }
-// Runtime: nodejs24.x   Handler: index.handler
-
 const REGION = 'aps1.pure.cloud';
-const CLIENT_ID = 'YOUR_CLIENT_ID';
-const CLIENT_SECRET = 'YOUR_CLIENT_SECRET';
+const client_id = 'YOUR_client_id';
+const client_secret = 'YOUR_client_secret';
 
-const ROW_TTL_MS = 60 * 60 * 1000;      // delete rows older than 1 hour
-const CLEANUP_EVERY_MS = 5 * 60 * 1000; // cleanup at most every 5 min per table
-const MAX_DELETES = 50;                 // keep each run fast
+const del_row_time = 60 * 60 * 1000;      
+const cleanup_every_min = 5 * 60 * 1000;
+const max_del = 50;                 
 
-// Cached while the container stays warm
 let cachedToken = null;
 let tokenExpiresAt = 0;
-const lastCleanupAt = {}; // per data table
+const lastCleanupAt = {};
 
 async function getToken() {
+    
   if (cachedToken && Date.now() < tokenExpiresAt) return cachedToken;
 
   const res = await fetch(`https://login.${REGION}/oauth/token`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
-      Authorization: 'Basic ' + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64'),
+      Authorization: 'Basic ' + Buffer.from(`${client_id}:${client_secret}`).toString('base64'),
     },
     body: 'grant_type=client_credentials',
   });
@@ -37,13 +31,13 @@ async function getToken() {
 }
 
 async function cleanupExpiredRows(rowsUrl, tableId, headers) {
-  if (Date.now() - (lastCleanupAt[tableId] || 0) < CLEANUP_EVERY_MS) return 0;
+  if (Date.now() - (lastCleanupAt[tableId] || 0) < cleanup_every_min) return 0;
   lastCleanupAt[tableId] = Date.now();
 
-  const cutoff = Date.now() - ROW_TTL_MS;
+  const cutoff = Date.now() - del_row_time;
   const expiredKeys = [];
 
-  for (let page = 1, pages = 1; page <= pages && expiredKeys.length < MAX_DELETES; page++) {
+  for (let page = 1, pages = 1; page <= pages && expiredKeys.length < max_del; page++) {
     const res = await fetch(`${rowsUrl}?pageNumber=${page}&pageSize=500&showbrief=false`, { headers });
     if (!res.ok) break;
 
@@ -51,9 +45,8 @@ async function cleanupExpiredRows(rowsUrl, tableId, headers) {
     pages = data.pageCount || 1;
 
     for (const row of data.entities || []) {
-      // Invalid/missing CreatedAt gives NaN, so the check below also treats it as expired
       if (!(Date.parse(row.CreatedAt) >= cutoff)) expiredKeys.push(row.key);
-      if (expiredKeys.length >= MAX_DELETES) break;
+      if (expiredKeys.length >= max_del) break;
     }
   }
 
@@ -63,6 +56,7 @@ async function cleanupExpiredRows(rowsUrl, tableId, headers) {
     )
   );
   return results.filter((r) => r.ok).length;
+  
 }
 
 exports.handler = async (event) => {
@@ -75,7 +69,6 @@ exports.handler = async (event) => {
   let headers;
   let result;
 
-  
   try {
     headers = { Authorization: `Bearer ${await getToken()}` };
 
@@ -90,10 +83,13 @@ exports.handler = async (event) => {
       result = { sendAlert: true, reason: 'first alert for this conversation' };
     } else {
       const text = await res.text();
-      result = res.status === 409 || /conflict|duplicate|already exists/i.test(text)
-        ? { sendAlert: false, reason: 'already alerted' }
-        // Any other error: fail open so a real alert is not missed
-        : { sendAlert: true, reason: `dedupe check failed (${res.status}): ${text.slice(0, 200)}` };
+      if (res.status === 409 || /conflict|duplicate|already exists/i.test(text)) {
+        // Row already exists -> alert was already sent for this conversation.
+        result = { sendAlert: false, reason: 'already alerted' };
+      } else {
+        // Any other error: fail open so a real GDF error is not silently missed.
+        result = { sendAlert: true, reason: `dedupe check failed (${res.status}): ${text.slice(0, 200)}` };
+      }
     }
   } catch (err) {
     return { sendAlert: true, reason: `dedupe check error: ${err.message}` };
@@ -107,7 +103,6 @@ exports.handler = async (event) => {
 
   return result;
 };
-
 
 
 
