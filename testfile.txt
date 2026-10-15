@@ -1,5 +1,5 @@
 ==============================================================================
- index.js  -  Trunk Monitoring (Genesys Cloud Function)
+ index.js  -  Trunk Monitoring (Genesys Cloud Function)   VERSION: 2026-10-15
  Before zipping: fill in LOGIN_ID, LOGIN_SECRET, GENESYS_REGION at the top.
  Data table ID is set: bcc6d769-e23f-43cf-8db3-b059b155d2dd
  Monitored numbers: MONITORED_NUMBER_PREFIX = '+1555111' (any format accepted)
@@ -159,6 +159,10 @@ async function getAccessKey() {
     throw new Error('OAuth failed: HTTP ' + response.status + (reason ? ' ' + reason.slice(0, 200) : ''));
   }
   const responseData = await response.json();
+
+  if (!responseData.access_token) {
+    throw new Error('OAuth failed: no access_token in login response');
+  }
 
   // keep it until 5 minutes before it expires
   savedAccessKey = responseData.access_token;
