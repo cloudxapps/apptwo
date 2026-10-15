@@ -1,305 +1,213 @@
-==============================================================================
- index.js  -  Trunk Monitoring (Genesys Cloud Function)   VERSION: 2026-10-15
- Before zipping: fill in LOGIN_ID, LOGIN_SECRET, GENESYS_REGION at the top.
- Data table ID is set: bcc6d769-e23f-43cf-8db3-b059b155d2dd
- Monitored numbers: MONITORED_NUMBER_PREFIX = '+1555111' (any format accepted)
- OAuth role: Telephony > Pcap > View; Architect > Datatable Row > Add, View, Delete
-==============================================================================
+'use strict';
 
-// Trunk Monitoring - Genesys Cloud Function
-// Checks the SIP trace of a call and reports SIP error codes (4xx/5xx/6xx).
-// Input:  conversationId, ani (optional), dnis (optional)
-// Output: connid, method, ani, dnis, traceFound, message
+const clientId = '';
+const clientSecret = '';
+const traceTime = 30;
+const sipCodes = ['4xx', '5xx', '6xx'];
+const ign_sipCodes = ['401', '407'];
+const datatableId = '';
+const removeTime = 30;
 
-// ---------- Settings ----------
-const LOGIN_ID = 'PASTE_CLIENT_ID_HERE';
-const LOGIN_SECRET = 'PASTE_CLIENT_SECRET_HERE';
-const GENESYS_REGION = 'mypurecloud.com';
 
-const SENT_ALERTS_TABLE_ID = 'bcc6d769-e23f-43cf-8db3-b059b155d2dd'; // Trunk_Monitoring_Sent
-const LOOK_BACK_MINUTES = 60;          // how far back to search SIP traces
-const KEEP_ALERT_RECORD_MINUTES = 60;  // delete table rows older than this
+function getConfig() {
+  return {
+    clientId: clientId,
+    clientSecret: clientSecret,
+  };
+}
 
-// Only calls to numbers starting with this prefix are checked (other calls make no API calls)
-const MONITORED_NUMBER_PREFIX = '+1555111';
+function isFailureCode(code) {
+  if (!/^\d{3}$/.test(code) || ign_sipCodes.includes(code)) return false;
+  return sipCodes.some((p) => {
+    const pat = String(p).toLowerCase();
+    return /^\dxx$/.test(pat) ? code[0] === pat[0] : code === pat;
+  });
+}
 
-const ERROR_CODES_TO_WATCH = ['4xx', '5xx', '6xx'];
-const CODES_TO_SKIP = ['401', '407'];
+async function getToken(cfg) {
+  const basic = Buffer.from(`${cfg.clientId}:${cfg.clientSecret}`).toString('base64');
+  const res = await fetch(`https://login.mypurecloud.com/oauth/token`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${basic}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials',
+  });
+  if (!res.ok) throw new Error(`OAuth failed: HTTP ${res.status}`);
+  return (await res.json()).access_token;
+}
 
-const ERROR_CODE_MEANINGS = {
-  '400': 'Bad Request', '403': 'Forbidden', '404': 'Not Found', '408': 'Request Timeout',
-  '480': 'Temporarily Unavailable', '481': 'Call Does Not Exist', '484': 'Address Incomplete',
-  '486': 'Busy Here', '487': 'Request Terminated', '488': 'Not Acceptable Here',
-  '500': 'Server Internal Error', '502': 'Bad Gateway', '503': 'Service Unavailable',
-  '504': 'Server Time-out', '603': 'Decline'
+async function apiGet(cfg, token, path) {
+  const res = await fetch(`https://api.mypurecloud.com${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`GET ${path.split('?')[0]} failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+const stripTel = (v) => String(v || '').replace(/^tel:|^sip:/i, '').split('@')[0].split(';')[0];
+
+async function claimFirstReport(cfg, token, conversationId, codes) {
+  if (!datatableId || datatableId.startsWith('PASTE_')) return true;
+  const base = `https://api.mypurecloud.com/api/v2/flows/datatables/${encodeURIComponent(datatableId)}/rows`;
+  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+
+  const res = await fetch(base, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ key: conversationId, method: codes, reportedAt: new Date().toISOString() }),
+  });
+  if (res.ok) {
+    await cleanupOldRows(base, headers);
+    return true;
+  }
+
+  const check = await fetch(`${base}/${encodeURIComponent(conversationId)}`, { headers });
+  if (check.ok) return false;
+  throw new Error(`Data table insert failed: HTTP ${res.status}`);
+}
+
+async function cleanupOldRows(base, headers) {
+  try {
+    const cutoff = Date.now() - removeTime * 60 * 1000;
+    const oldKeys = [];
+    for (let page = 1; page <= 10; page++) {
+      const res = await fetch(`${base}?pageSize=500&pageNumber=${page}&showbrief=false`, { headers });
+      if (!res.ok) throw new Error(`list rows failed: HTTP ${res.status}`);
+      const body = await res.json();
+      for (const row of body.entities || []) {
+        const t = Date.parse(row.reportedAt);
+        if (row.key && !Number.isNaN(t) && t < cutoff) oldKeys.push(row.key);
+      }
+      if (!body.pageCount || page >= body.pageCount) break;
+    }
+    for (const key of oldKeys) {
+      const del = await fetch(`${base}/${encodeURIComponent(key)}`, { method: 'DELETE', headers });
+      if (!del.ok) throw new Error(`delete row failed: HTTP ${del.status}`);
+    }
+  } catch (err) {
+    console.error(`Trunk Monitoring cleanup skipped: ${err.message}`);
+  }
+}
+
+async function searchSipTraces(cfg, token, conversationId) {
+  const to = new Date();
+  const from = new Date(to.getTime() - traceTime * 60 * 1000);
+  const path = `/api/v2/telephony/siptraces?dateStart=${encodeURIComponent(from.toISOString())}`
+    + `&dateEnd=${encodeURIComponent(to.toISOString())}`
+    + `&conversationId=${encodeURIComponent(conversationId)}`;
+
+  const body = await apiGet(cfg, token, path);
+  const rows = Array.isArray(body) ? body : (body && (body.data || body.entities)) || [];
+  return rows;
+}
+
+// Checks every SIP message of the conversation (no ANI / DNIS filter)
+function analyzeTraces(rows) {
+  const r = {
+    matched: false,
+    matchedCodes: new Set(),
+    hasCancel: false,
+    fromUser: '',
+    toUser: '',
+    firstFrom: '',
+    firstTo: '',
+  };
+  for (const m of rows) {
+    const method = String(m.method || '').trim();
+    r.firstFrom = r.firstFrom || m.fromUser || '';
+    r.firstTo = r.firstTo || m.toUser || '';
+    if (method.toUpperCase() === 'CANCEL') r.hasCancel = true;
+
+    if (isFailureCode(method)) {
+      r.matched = true;
+      r.matchedCodes.add(method);
+      r.fromUser = r.fromUser || m.fromUser || '';
+      r.toUser = r.toUser || m.toUser || '';
+    }
+  }
+  return r;
+}
+
+const SIP_TEXT = {
+  400: 'Bad Request', 403: 'Forbidden', 404: 'Not Found', 408: 'Request Timeout',
+  480: 'Temporarily Unavailable', 481: 'Call Does Not Exist', 484: 'Address Incomplete',
+  486: 'Busy Here', 487: 'Request Terminated', 488: 'Not Acceptable Here',
+  500: 'Server Internal Error', 502: 'Bad Gateway', 503: 'Service Unavailable',
+  504: 'Server Time-out', 603: 'Decline',
 };
-
-const GENESYS_API_ADDRESS = 'https://api.' + GENESYS_REGION;
-const SENT_ALERTS_TABLE_ADDRESS = GENESYS_API_ADDRESS + '/api/v2/flows/datatables/' + SENT_ALERTS_TABLE_ID + '/rows';
-
-// Access key kept between runs, so we don't log in again for every call
-let savedAccessKey = '';
-let savedAccessKeyExpiresAt = 0;
+const describe = (c) => (SIP_TEXT[c] ? `${c} ${SIP_TEXT[c]}` : String(c));
 
 
-// ---------- Main ----------
-exports.handler = async (event) => {
-  const callReport = {
-    connid: event.conversationId || '',
-    method: '',
+async function checkConversation(event, context) {
+  const conversationId = event && event.conversationId;
+  const out = {
+    conversationId: conversationId || '',
+    traceFound: false,
+    matchedCodes: '',
+    duplicate: false,
+    hasCancel: false,
     ani: '',
     dnis: '',
-    traceFound: false,
-    message: ''
+    error: '',
   };
 
   try {
-    if (!event.conversationId) {
-      throw new Error('conversationId is required');
+    if (!conversationId) throw new Error('conversationId is required');
+    const cfg = getConfig();
+    if (!cfg.clientId || cfg.clientId.startsWith('PASTE_') || !cfg.clientSecret || cfg.clientSecret.startsWith('PASTE_')) {
+      throw new Error('clientId / clientSecret not set in index.js');
     }
 
-    // 0. Skip calls that are not to a monitored number (no API calls)
-    if (event.dnis && !isMonitoredNumber(event.dnis)) {
-      callReport.dnis = tidyPhoneNumber(event.dnis);
-      callReport.message = 'Not a monitored number';
-      return callReport;
-    }
+    const token = await getToken(cfg);
+    const rows = await searchSipTraces(cfg, token, conversationId);
+    out.traceFound = rows.length > 0;
 
-    const accessKey = await getAccessKey();
-    const requestHeaders = { Authorization: 'Bearer ' + accessKey, 'Content-Type': 'application/json' };
+    const t = analyzeTraces(rows);
+    Object.assign(out, {
+      matchedCodes: [...t.matchedCodes].join(','),
+      hasCancel: t.hasCancel,
+      // ani / dnis are only for the email: use the workflow values if given, else the SIP trace
+      ani: (event && event.ani) || t.fromUser || t.firstFrom,
+      dnis: (event && event.dnis) || t.toUser || t.firstTo,
+    });
 
-    // 1. Get the SIP messages for this call
-    const sipMessages = await getSipMessagesForCall(event.conversationId, requestHeaders);
-    callReport.traceFound = sipMessages.length > 0;
-    if (sipMessages.length === 0) {
-      callReport.message = 'No SIP trace found for this call';
-      return callReport;
-    }
-
-    // 2. Look for error codes
-    const errorCodesFound = [];
-    let callWasCancelled = false;
-
-    for (const sipMessage of sipMessages) {
-      const responseCode = String(sipMessage.method || '').trim();
-
-      if (responseCode === 'CANCEL') {
-        callWasCancelled = true;
+    if (out.matchedCodes) {
+      const first = await claimFirstReport(cfg, token, conversationId, out.matchedCodes);
+      if (!first) {
+        out.duplicate = true;
+        out.matchedCodes = '';
       }
-
-      // numbers of the first message, used if no error is found
-      if (!callReport.ani) callReport.ani = sipMessage.fromUser || '';
-      if (!callReport.dnis) callReport.dnis = sipMessage.toUser || '';
-
-      if (!isErrorCode(responseCode)) continue;
-
-      // only count errors on this call's leg (if ani / dnis were passed in)
-      if (event.ani && !isSamePhoneNumber(event.ani, sipMessage.fromUser)) continue;
-      if (event.dnis && !isSamePhoneNumber(event.dnis, sipMessage.toUser)) continue;
-
-      if (!errorCodesFound.includes(responseCode)) {
-        errorCodesFound.push(responseCode);
-      }
-      callReport.ani = sipMessage.fromUser || callReport.ani;
-      callReport.dnis = sipMessage.toUser || callReport.dnis;
     }
-
-    callReport.ani = tidyPhoneNumber(callReport.ani);
-    callReport.dnis = tidyPhoneNumber(callReport.dnis);
-
-    if (errorCodesFound.length === 0) {
-      callReport.message = 'No failure';
-      return callReport;
-    }
-
-    // 3. Send only one alert per call (the trigger can fire more than once)
-    const isFirstAlert = await rememberAlertSent(event.conversationId, errorCodesFound.join(','), requestHeaders);
-    if (!isFirstAlert) {
-      callReport.message = 'Already reported for this conversation';
-      return callReport;
-    }
-
-    await removeOldAlertRecords(requestHeaders);
-
-    // 4. Build the report
-    callReport.method = errorCodesFound.join(',');
-    const readableErrors = errorCodesFound.map(errorCode =>
-      ERROR_CODE_MEANINGS[errorCode] ? errorCode + ' ' + ERROR_CODE_MEANINGS[errorCode] : errorCode);
-    callReport.message = 'SIP failure: ' + readableErrors.join(', ');
-    if (callWasCancelled) {
-      callReport.message += ' (CANCEL seen)';
-    }
-  } catch (problem) {
-    console.error('Trunk Monitoring error for ' + callReport.connid + ': ' + problem.message);
-    callReport.method = '';
-    callReport.message = 'Check failed: ' + problem.message;
+  } catch (err) {
+    out.error = String(err && err.message ? err.message : err);
   }
+  return out;
+}
 
-  return callReport;
+const cleanNum = (v) => stripTel(v);
+
+function buildMessage(r) {
+  if (r.error) return `Check failed: ${r.error}`;
+  if (!r.traceFound) return 'No SIP trace found for this call';
+  if (r.duplicate) return 'Already reported for this conversation';
+  if (!r.matchedCodes) return 'No failure';
+  const codes = r.matchedCodes.split(',').map(describe).join(', ');
+  return `SIP failure: ${codes}${r.hasCancel ? ' (CANCEL seen)' : ''}`;
+}
+
+
+exports.handler = async (event, context) => {
+  const r = await checkConversation(event, context);
+  if (r.error) console.error(`Trunk Monitoring error for ${r.conversationId}: ${r.error}`);
+  return {
+    connid: r.conversationId,
+    method: r.matchedCodes,
+    ani: cleanNum(r.ani),
+    dnis: cleanNum(r.dnis),
+    traceFound: r.traceFound,
+    message: buildMessage(r),
+  };
 };
-
-
-// ---------- Helpers ----------
-
-// Log in to Genesys and get an access key (reuses the saved one while it is still valid)
-async function getAccessKey() {
-  if (savedAccessKey && Date.now() < savedAccessKeyExpiresAt) {
-    return savedAccessKey;
-  }
-
-  const loginDetails = Buffer.from(LOGIN_ID + ':' + LOGIN_SECRET).toString('base64');
-  const response = await fetch('https://login.' + GENESYS_REGION + '/oauth/token', {
-    method: 'POST',
-    headers: { Authorization: 'Basic ' + loginDetails, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'grant_type=client_credentials'
-  });
-  if (!response.ok) {
-    // include Genesys's reason, e.g. "invalid_client" or "unauthorized_client"
-    const reason = await response.text().catch(() => '');
-    throw new Error('OAuth failed: HTTP ' + response.status + (reason ? ' ' + reason.slice(0, 200) : ''));
-  }
-  const responseData = await response.json();
-
-  if (!responseData.access_token) {
-    throw new Error('OAuth failed: no access_token in login response');
-  }
-
-  // keep it until 5 minutes before it expires
-  savedAccessKey = responseData.access_token;
-  savedAccessKeyExpiresAt = Date.now() + ((responseData.expires_in || 3600) - 300) * 1000;
-  return savedAccessKey;
-}
-
-// Search SIP traces for the call in the last LOOK_BACK_MINUTES
-async function getSipMessagesForCall(conversationId, requestHeaders) {
-  const searchTo = new Date();
-  const searchFrom = new Date(searchTo.getTime() - LOOK_BACK_MINUTES * 60 * 1000);
-  const searchAddress = GENESYS_API_ADDRESS + '/api/v2/telephony/siptraces'
-    + '?dateStart=' + encodeURIComponent(searchFrom.toISOString())
-    + '&dateEnd=' + encodeURIComponent(searchTo.toISOString())
-    + '&conversationId=' + encodeURIComponent(conversationId);
-
-  let response = await fetch(searchAddress, { headers: requestHeaders });
-
-  // 401 = saved access key no longer accepted: log in again and retry once
-  if (response.status === 401) {
-    savedAccessKey = '';
-    savedAccessKeyExpiresAt = 0;
-    const newAccessKey = await getAccessKey();
-    requestHeaders.Authorization = 'Bearer ' + newAccessKey;
-    response = await fetch(searchAddress, { headers: requestHeaders });
-  }
-
-  if (response.status === 404) return [];
-  if (!response.ok) throw new Error('SIP trace search failed: HTTP ' + response.status);
-
-  const responseData = await response.json();
-  if (Array.isArray(responseData)) return responseData;
-  return responseData.data || responseData.entities || [];
-}
-
-// true if the code is an error code we watch
-function isErrorCode(responseCode) {
-  if (!/^\d{3}$/.test(responseCode)) return false;   // not a response code (INVITE, ACK, ...)
-  if (CODES_TO_SKIP.includes(responseCode)) return false;
-  for (const watchedCode of ERROR_CODES_TO_WATCH) {
-    if (watchedCode === responseCode) return true;                                          // exact code, e.g. '487'
-    if (watchedCode.endsWith('xx') && watchedCode[0] === responseCode[0]) return true;      // group, e.g. '5xx'
-  }
-  return false;
-}
-
-// true if the number starts with MONITORED_NUMBER_PREFIX.
-// Works for any format: "tel:+15551112102", "+15551112102", "15551112102", "555-111-2102"
-function isMonitoredNumber(phoneNumber) {
-  const numberDigits = String(phoneNumber || '').replace(/\D/g, '').slice(-10);           // 10-digit number
-  const prefixDigits = MONITORED_NUMBER_PREFIX.replace(/^\+?1/, '').replace(/\D/g, '');  // "+1555111" -> "555111"
-  return numberDigits.length === 10 && numberDigits.startsWith(prefixDigits);
-}
-
-// Compare two phone numbers using the last 10 digits
-function isSamePhoneNumber(firstNumber, secondNumber) {
-  const firstDigits = String(firstNumber || '').replace(/\D/g, '').slice(-10);
-  const secondDigits = String(secondNumber || '').replace(/\D/g, '').slice(-10);
-  return firstDigits !== '' && firstDigits === secondDigits;
-}
-
-// "tel:+13135551234" -> "+13135551234"
-function tidyPhoneNumber(phoneNumber) {
-  return String(phoneNumber || '').replace(/^tel:|^sip:/i, '').split('@')[0].split(';')[0];
-}
-
-// Add a record for this call. Returns true if it is new, false if it was already there.
-async function rememberAlertSent(conversationId, errorCodes, requestHeaders) {
-  const alertRecord = { key: conversationId, method: errorCodes, reportedAt: new Date().toISOString() };
-  const response = await fetch(SENT_ALERTS_TABLE_ADDRESS, {
-    method: 'POST', headers: requestHeaders, body: JSON.stringify(alertRecord)
-  });
-  if (response.ok) return true;
-
-  const existingRecord = await fetch(SENT_ALERTS_TABLE_ADDRESS + '/' + encodeURIComponent(conversationId), { headers: requestHeaders });
-  if (existingRecord.ok) return false;   // record exists -> already reported
-  throw new Error('Data table insert failed: HTTP ' + response.status);
-}
-
-// Delete records older than KEEP_ALERT_RECORD_MINUTES. Problems here do not stop the alert.
-async function removeOldAlertRecords(requestHeaders) {
-  try {
-    const oldestTimeToKeep = Date.now() - KEEP_ALERT_RECORD_MINUTES * 60 * 1000;
-    const response = await fetch(SENT_ALERTS_TABLE_ADDRESS + '?pageSize=500&showbrief=false', { headers: requestHeaders });
-    if (!response.ok) throw new Error('HTTP ' + response.status);
-    const responseData = await response.json();
-
-    for (const alertRecord of responseData.entities || []) {
-      const recordTime = Date.parse(alertRecord.reportedAt);
-      if (alertRecord.key && recordTime < oldestTimeToKeep) {
-        await fetch(SENT_ALERTS_TABLE_ADDRESS + '/' + encodeURIComponent(alertRecord.key), {
-          method: 'DELETE', headers: requestHeaders
-        });
-      }
-    }
-  } catch (problem) {
-    console.error('Cleanup skipped: ' + problem.message);
-  }
-}
-
-==============================================================================
- INPUT CONTRACT
-==============================================================================
-
-{
-  "title": "Trunk Monitoring input",
-  "type": "object",
-  "required": ["conversationId"],
-  "properties": {
-    "conversationId": {
-      "type": "string",
-      "description": "Conversation ID passed from the trigger / workflow"
-    },
-    "ani": {
-      "type": "string",
-      "description": "Optional. Calling number of this call (from the trigger). When set, only failures on the SIP leg from this ANI are reported."
-    },
-    "dnis": {
-      "type": "string",
-      "description": "Optional. Called number of this call (from the trigger). When set, only failures on the SIP leg to this DNIS are reported."
-    }
-  }
-}
-
-==============================================================================
- OUTPUT CONTRACT
-==============================================================================
-
-{
-  "title": "Trunk Monitoring output",
-  "type": "object",
-  "properties": {
-    "connid": { "type": "string", "description": "Genesys conversation ID" },
-    "method": { "type": "string", "description": "SIP failure code(s) found, e.g. 487 or 480,500. Empty = no failure" },
-    "ani": { "type": "string", "description": "Calling number" },
-    "dnis": { "type": "string", "description": "Called number" },
-    "traceFound": { "type": "boolean", "description": "true = SIP trace found for this call, false = no SIP trace found" },
-    "message": { "type": "string", "description": "Result text, e.g. 'SIP failure: 487 Request Terminated' or 'No failure'" }
-  }
-}
