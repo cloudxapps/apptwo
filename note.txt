@@ -1,1 +1,27 @@
 
+WITH pci AS (
+  SELECT DISTINCT conversation_id
+  FROM A3S_GCD.PUBLIC.ATTRIBUTES
+  WHERE keyname ILIKE '%PCIPalSessionId%'
+    AND CONVERT_TIMEZONE('UTC','America/New_York', last_modified)::date
+        BETWEEN '2026-10-18' AND '2026-10-20'      -- change dates here
+),
+STA AS (
+  SELECT DISTINCT p.conversation_id,
+         p.transcript_id,
+         p.start_time_ms,
+         p.participant_purpose,
+         p.text
+  FROM pci
+  JOIN A3S_GCD.PUBLIC.STA_TRANSCRIPT_PHRASES p
+    ON p.conversation_id = pci.conversation_id
+)
+SELECT conversation_id,
+       TO_TIMESTAMP_NTZ(MIN(start_time_ms), 3) AS first_phrase_utc,
+       TO_TIMESTAMP_NTZ(MAX(start_time_ms), 3) AS last_phrase_utc,
+       COUNT(*) AS phrase_count,
+       LISTAGG(participant_purpose || ': ' || text, ' | ')
+         WITHIN GROUP (ORDER BY start_time_ms) AS transcript
+FROM STA
+GROUP BY conversation_id
+ORDER BY first_phrase_utc;
