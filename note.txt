@@ -1,15 +1,9 @@
-
--- Eastern-time dates (same as your 2nd query)
-SET from_date = '2026-10-20';   -- today
-SET to_date   = '2026-10-20';   -- same day; set from_date = '2026-10-18' to cover 3 days
-
 WITH pci AS (
-  SELECT DISTINCT conversation_id
-  FROM attributes
+  SELECT DISTINCT conversation_id, value AS pcipal_session_id
+  FROM A3S_GCD.PUBLIC.ATTRIBUTES
   WHERE keyname ILIKE '%PCIPalSessionId%'
-    AND CONVERT_TIMEZONE('UTC', 'America/New_York',
-          TO_TIMESTAMP_NTZ(start_date_time_key))::date
-        BETWEEN $from_date::date AND $to_date::date
+    AND CONVERT_TIMEZONE('UTC','America/New_York', last_modified)::date
+        BETWEEN '2026-10-18'::date AND '2026-10-20'::date   -- edit dates here
 ),
 trs AS (
   SELECT p.conversation_id,
@@ -19,18 +13,17 @@ trs AS (
          LISTAGG(p.participant_purpose || ': ' || p.text, ' | ')
            WITHIN GROUP (ORDER BY p.start_time_ms) AS transcript
   FROM (SELECT DISTINCT conversation_id, transcript_id, start_time_ms,
-                        participant_purpose, text
+               participant_purpose, text
         FROM A3S_GCD.PUBLIC.STA_TRANSCRIPT_PHRASES) p
   JOIN pci ON pci.conversation_id = p.conversation_id
   GROUP BY p.conversation_id
 )
 SELECT pci.conversation_id,
+       pci.pcipal_session_id,
        t.first_phrase_utc,
        t.last_phrase_utc,
        t.phrase_count,
        t.transcript
-       -- , r.recording_id, r.media_uri ...   (see note below)
 FROM pci
 LEFT JOIN trs t ON t.conversation_id = pci.conversation_id
--- LEFT JOIN A3S_GCD.PUBLIC.<RECORDING_TABLE> r ON r.conversation_id = pci.conversation_id
 ORDER BY t.first_phrase_utc;
