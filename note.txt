@@ -1,1 +1,37 @@
 
+WITH pci AS (
+  SELECT DISTINCT conversation_id
+  FROM A3S_GCD.PUBLIC.ATTRIBUTES
+  WHERE keyname ILIKE '%PCIPalSessionId%'
+    AND CONVERT_TIMEZONE('UTC','America/New_York', last_modified)::date
+        BETWEEN '2026-10-01'::date AND '2026-10-20'::date
+),
+STA AS (
+  SELECT DISTINCT pci.conversation_id,
+         p.transcript_id,
+         p.start_time_ms,
+         p.participant_purpose,
+         p.text
+  FROM pci
+  JOIN A3S_GCD.PUBLIC.STA_TRANSCRIPT_PHRASES p
+    ON p.conversation_id = pci.conversation_id
+  WHERE p.participant_purpose ILIKE 'external'
+    AND (
+          p.text ILIKE '%credit card%'
+       OR p.text ILIKE '%cv number%'
+    )
+    AND REGEXP_LIKE(
+          p.text,
+          $$.*\b(zero|one|two|three|four|five|six|seven|eight|nine)([[:space:][:punct:]]+(zero|one|two|three|four|five|six|seven|eight|nine)){2,}\b.*$$,
+          'i'
+    )
+)
+SELECT conversation_id,
+       TO_TIMESTAMP_NTZ(MIN(start_time_ms), 3) AS start_phrase_utc,
+       TO_TIMESTAMP_NTZ(MAX(start_time_ms), 3) AS end_phrase_utc,
+       COUNT(text) AS phrase_count,
+       LISTAGG(participant_purpose || ': ' || text, ' | ')
+         WITHIN GROUP (ORDER BY start_time_ms) AS transcript
+FROM STA
+GROUP BY conversation_id
+ORDER BY start_phrase_utc;
