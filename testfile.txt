@@ -8,6 +8,8 @@ Meeting Summary
 
 The team discussed a daily report for Genesys calls. The key metrics are total calls, member and provider calls, short or dropped calls, calls handled in the IVR, and calls routed to an agent.
 
+For this report, direct member calls will be counted as member calls. Calls routed through the provider GDF (Google Dialogflow) IVR will be counted as provider calls. The team will confirm these classifications against the participant and call-flow data.
+
 The report should count each voice call once. To do this, the query needs to exclude the extra PCI PAL call leg and email-channel conversations.
 
 The team will review the Genesys and Snowflake data to understand which fields can identify member and provider calls, call duration and drop reasons, IVR routing, and whether a call was contained in the IVR or sent to an agent.
@@ -33,3 +35,7 @@ Sreeni: Once the team confirms the query returns the required data, coordinate t
 Everyone: Use the daily touchpoints to review progress and resolve open questions. If the workload affects Salesforce or another priority, raise the capacity concern with Steven and Ankit.
 
 Please let us know if we missed anything.
+
+Our team: After checking the query results, email Steven and Sreeni with the findings and proposed reporting logic.
+
+Sreeni: Once the team confirms that the query returns the required data, coordinate the Snowflake automation for the daily email.
