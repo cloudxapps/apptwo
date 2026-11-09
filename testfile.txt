@@ -36,6 +36,23 @@ Everyone: Use the daily touchpoints to review progress and resolve open question
 
 Please let us know if we missed anything.
 
+----------------
+
+
+Our team — Uday, Ankit Sujantee, Rajeswaran, Kumar Ankit, and Piyush: Review the two queries Sreeni shared and identify which Snowflake fields are needed for each metric.
+
+Our team: Check that the query counts each voice call once by excluding the extra PCI PAL call leg and email-channel conversations.
+
+Our team: Test how the data identifies member and provider calls, short or dropped calls, calls handled in the IVR, and calls routed to an agent. Confirm the short-call time limit and report any gaps or questions.
+
+Our team: After checking the query results, email Steven and Sreeni with the findings and proposed reporting logic.
+
+Sreeni: Once the team confirms that the query returns the required data, coordinate the Snowflake automation for the daily email.
+
+Everyone: Use the daily touchpoints to review progress and resolve open questions.
+
+
+
 Our team: After checking the query results, email Steven and Sreeni with the findings and proposed reporting logic.
 
 Sreeni: Once the team confirms that the query returns the required data, coordinate the Snowflake automation for the daily email.
