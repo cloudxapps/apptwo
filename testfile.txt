@@ -1,1 +1,35 @@
+subject: MOM: Genesys Call Metrics Discussion
 
+Hi Steven and Sreeni,
+
+Thanks for the discussion. Please find the meeting summary and action items below.
+
+Meeting Summary
+
+The team discussed a daily report for Genesys calls. The key metrics are total calls, member and provider calls, short or dropped calls, calls handled in the IVR, and calls routed to an agent.
+
+The report should count each voice call once. To do this, the query needs to exclude the extra PCI PAL call leg and email-channel conversations.
+
+The team will review the Genesys and Snowflake data to understand which fields can identify member and provider calls, call duration and drop reasons, IVR routing, and whether a call was contained in the IVR or sent to an agent.
+
+The short-call cutoff still needs to be confirmed. The discussion mentioned both the previous 3-second measure and a 5-second check in the query.
+
+The first version will be a table of the previous day’s metrics sent by email. A dashboard can be considered later, after the data and reporting logic have been checked.
+
+The Genesys reporting work should move forward in parallel with the Salesforce work. Salesforce remains a priority and should not be put on hold.
+
+Action Items
+
+Our team — Uday, Ankit Sujantee, Rajeswaran, Kumar Ankit, and Piyush: Review the two queries Sreeni shared and identify the Snowflake tables and fields needed for each metric.
+
+Our team: Check that the query counts each voice call once by excluding the extra PCI PAL call leg and email-channel conversations.
+
+Our team: Test the member and provider split, short-call cutoff, dropped-call reason, IVR routing and containment, and calls routed to agents using sample data. Note any gaps or cases that need clarification.
+
+Our team: Email Steven and Sreeni the findings, proposed data fields, validated reporting logic, and suggested table format for the daily email.
+
+Sreeni: Once the team confirms the query returns the required data, coordinate the Snowflake automation for the daily email.
+
+Everyone: Use the daily touchpoints to review progress and resolve open questions. If the workload affects Salesforce or another priority, raise the capacity concern with Steven and Ankit.
+
+Please let us know if we missed anything.
