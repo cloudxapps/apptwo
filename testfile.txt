@@ -1,1 +1,137 @@
 
+=====================================================================
+ BCBSM - Stage 1: Genesys calls received
+ Study queries (run each one separately, in order, and share the output)
+ Report day = yesterday in US Eastern time
+=====================================================================
+
+
+---------------------------------------------------------------------
+ Q1. Columns in the segment table
+     Purpose: find the real names for direction, media type, ANI, DNIS,
+     disconnect type and flow name. Share the full list.
+---------------------------------------------------------------------
+
+SELECT column_name, data_type
+FROM A3S_GCD.INFORMATION_SCHEMA.COLUMNS
+WHERE table_schema = 'PUBLIC'
+  AND table_name   = 'CONVERSATIONS_SEGMENT_FACT'
+ORDER BY ordinal_position;
+
+
+---------------------------------------------------------------------
+ Q2. One real call, all its rows
+     Purpose: see how many segment rows one conversation has.
+     Replace <CONVERSATION_ID> with any inbound call from yesterday.
+---------------------------------------------------------------------
+
+SELECT *
+FROM A3S_GCD.PUBLIC.CONVERSATIONS_SEGMENT_FACT
+WHERE conversation_id = '<CONVERSATION_ID>'
+ORDER BY segment_start_ts;
+
+
+---------------------------------------------------------------------
+ Q3. Segment rows vs distinct calls (yesterday)
+     Purpose: show why we count conversations, not rows.
+---------------------------------------------------------------------
+
+SELECT COUNT(*)                        AS segment_rows,
+       COUNT(DISTINCT conversation_id) AS distinct_calls
+FROM A3S_GCD.PUBLIC.CONVERSATIONS_SEGMENT_FACT
+WHERE CONVERT_TIMEZONE('UTC', 'America/New_York',
+        TO_TIMESTAMP_NTZ(segment_start_ts))::date
+      = DATEADD(day, -1, CONVERT_TIMEZONE('America/New_York', CURRENT_TIMESTAMP())::date);
+
+
+---------------------------------------------------------------------
+ Q4. Channels and directions (yesterday)
+     Purpose: confirm the voice / e-mail values and inbound label.
+     NOTE: if it errors, replace media_type / direction with the
+     column names from Q1.
+---------------------------------------------------------------------
+
+SELECT media_type,
+       direction,
+       COUNT(DISTINCT conversation_id) AS calls
+FROM A3S_GCD.PUBLIC.CONVERSATIONS_SEGMENT_FACT
+WHERE CONVERT_TIMEZONE('UTC', 'America/New_York',
+        TO_TIMESTAMP_NTZ(segment_start_ts))::date
+      = DATEADD(day, -1, CONVERT_TIMEZONE('America/New_York', CURRENT_TIMESTAMP())::date)
+GROUP BY 1, 2
+ORDER BY calls DESC;
+
+
+---------------------------------------------------------------------
+ Q5. PCI Pal - do both legs share the same session ID? (yesterday)
+     Purpose: decide how to pair and drop the duplicate leg.
+     conversations = 2  -> both legs share the session ID
+     conversations = 1  -> second leg does not carry it
+---------------------------------------------------------------------
+
+SELECT value                                    AS pcipal_session,
+       COUNT(DISTINCT conversation_id)          AS conversations,
+       LISTAGG(DISTINCT conversation_id, ', ')  AS conversation_ids
+FROM attributes
+WHERE keyname ILIKE '%PCIPalSessionId%'
+  AND CONVERT_TIMEZONE('UTC', 'America/New_York',
+        TO_TIMESTAMP_NTZ(start_date_time_key))::date
+      = DATEADD(day, -1, CONVERT_TIMEZONE('America/New_York', CURRENT_TIMESTAMP())::date)
+GROUP BY 1
+ORDER BY conversations DESC;
+
+
+---------------------------------------------------------------------
+ Q6. PCI Pal - summary of Q5 (yesterday)
+     Purpose: how many sessions have 1 vs 2+ conversations.
+---------------------------------------------------------------------
+
+SELECT conversations,
+       COUNT(*) AS sessions
+FROM (
+  SELECT value                           AS pcipal_session,
+         COUNT(DISTINCT conversation_id) AS conversations
+  FROM attributes
+  WHERE keyname ILIKE '%PCIPalSessionId%'
+    AND CONVERT_TIMEZONE('UTC', 'America/New_York',
+          TO_TIMESTAMP_NTZ(start_date_time_key))::date
+        = DATEADD(day, -1, CONVERT_TIMEZONE('America/New_York', CURRENT_TIMESTAMP())::date)
+  GROUP BY 1
+)
+GROUP BY 1
+ORDER BY 1;
+
+
+---------------------------------------------------------------------
+ Q7. PCI Pal - compare one pair side by side
+     Purpose: see which leg is the real call and which is the duplicate.
+     Replace <ID_1>, <ID_2> with two IDs from one row of Q5.
+     If Q5 shows only 1 conversation per session, use one PCI Pal
+     conversation ID here and we will look for its partner by time.
+     NOTE: if it errors, replace direction / ani / dnis with the
+     column names from Q1, or use SELECT * instead.
+---------------------------------------------------------------------
+
+SELECT conversation_id,
+       purpose,
+       direction,
+       ani,
+       dnis,
+       TO_TIMESTAMP_NTZ(segment_start_ts) AS start_utc,
+       TO_TIMESTAMP_NTZ(segment_end_ts)   AS end_utc
+FROM A3S_GCD.PUBLIC.CONVERSATIONS_SEGMENT_FACT
+WHERE conversation_id IN ('<ID_1>', '<ID_2>')
+ORDER BY segment_start_ts;
+
+
+=====================================================================
+ What to share back
+   Q1  full column list (screenshot or export)
+   Q2  all rows for the sample call
+   Q3  the two counts
+   Q4  the full result
+   Q5  first 10 rows
+   Q6  full result
+   Q7  all rows for the pair
+ Cover any phone numbers (ANI) before sharing screenshots.
+=====================================================================
