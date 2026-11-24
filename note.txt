@@ -1,1 +1,355 @@
+/* =====================================================================
+   BCBSM - Genesys / GDF daily call statistics - FINAL QUERIES
+   Source : A3S_GCD (Snowflake) - CONVERSATIONS_SEGMENT_FACT + ATTRIBUTES
+   Period : previous calendar day, US Eastern (America/New_York)
+   To test a fixed day, replace the params line with e.g.
+       SELECT '2026-11-18'::date AS report_date
+
+   Query 1 - Business item 1     : Genesys calls received
+   Query 2 - Business items 2, 3 : Member / Provider servicing - successful vs dropped
+   Query 3 - Business item 4     : Calls routed to GDF IVR - Member IVR / Provider IVR
+
+   All three use the same calls-received base, so their totals always match.
+   ===================================================================== */
+
+
+/* =====================================================================
+   QUERY 1 - Business item 1: Genesys calls received
+   ---------------------------------------------------------------------
+--we are checking with CONVERSATIONS_SEGMENT_FACT (direction, media type, flow name)
+
+--RESULT--
+--inbound_conversations_before_dedup : inbound voice conversations before PCI Pal clean-up
+--pci_pal_duplicate_legs_removed     : a call to a PCI Pal toll-free number creates two conversations
+--                                     (PCI_PAL_Outbound -> PCI_PAL_Inbound, same caller, within 2 min
+--                                     or while leg 1 still connected); leg 1 is removed
+--inbound_calls_received             : BUSINESS ITEM 1 - real inbound calls, each counted once
+--outbound_calls                     : calls placed out by agents / system
+--callbacks                          : callback conversations (counted separately)
+--total_contacts                     : inbound_calls_received + outbound_calls + callbacks
+--Test calls (flows starting Test_) are excluded.
+   ===================================================================== */
+
+WITH params AS (
+  SELECT DATEADD(day, -1, CONVERT_TIMEZONE('America/New_York', CURRENT_TIMESTAMP())::date) AS report_date
+),
+conv AS ( -- one row per conversation
+  SELECT s.conversation_id,
+         MIN(s.conversation_start)                                           AS conv_start,
+         MAX(s.segment_end)                                                  AS conv_end,
+         MAX(LOWER(s.originating_direction))                                 AS direction,
+         COUNT_IF(LOWER(s.media_type) = 'voice')    > 0                      AS has_voice,
+         COUNT_IF(LOWER(s.media_type) = 'callback') > 0                      AS has_callback,
+         MAX(IFF(LOWER(s.purpose) IN ('customer', 'external'), s.ani, NULL)) AS caller_ani,
+         COUNT_IF(s.flow_name = 'PCI_PAL_Outbound') > 0                      AS is_pci_leg1,
+         COUNT_IF(s.flow_name = 'PCI_PAL_Inbound')  > 0                      AS is_pci_leg2,
+         COUNT_IF(STARTSWITH(LOWER(s.flow_name), 'test_')) > 0               AS is_test
+  FROM A3S_GCD.PUBLIC.CONVERSATIONS_SEGMENT_FACT s
+  CROSS JOIN params p
+  WHERE CONVERT_TIMEZONE('UTC', 'America/New_York', s.conversation_start)::date
+        BETWEEN p.report_date AND DATEADD(day, 1, p.report_date)
+  GROUP BY s.conversation_id
+),
+day_calls AS ( -- conversations that started on the report day, no test calls
+  SELECT c.*
+  FROM conv c
+  CROSS JOIN params p
+  WHERE CONVERT_TIMEZONE('UTC', 'America/New_York', c.conv_start)::date = p.report_date
+    AND NOT c.is_test
+),
+pci_duplicates AS ( -- PCI Pal leg 1 whose return leg came back
+  SELECT DISTINCT l1.conversation_id
+  FROM day_calls l1
+  JOIN conv l2
+    ON  l2.is_pci_leg2
+    AND l2.direction  = 'inbound'
+    AND l2.caller_ani = l1.caller_ani
+    AND (   l2.conv_start BETWEEN l1.conv_start AND DATEADD(minute, 2, l1.conv_start)
+         OR l2.conv_start BETWEEN l1.conv_start AND l1.conv_end)
+  WHERE l1.is_pci_leg1
+    AND l1.direction = 'inbound'
+)
+SELECT p.report_date,
+       COUNT_IF(c.direction = 'inbound'  AND c.has_voice AND NOT c.has_callback)   AS inbound_conversations_before_dedup,
+       COUNT_IF(c.direction = 'inbound'  AND c.has_voice AND NOT c.has_callback
+                AND d.conversation_id IS NOT NULL)                                 AS pci_pal_duplicate_legs_removed,
+       COUNT_IF(c.direction = 'inbound'  AND c.has_voice AND NOT c.has_callback
+                AND d.conversation_id IS NULL)                                     AS inbound_calls_received,
+       COUNT_IF(c.direction = 'outbound' AND c.has_voice AND NOT c.has_callback)   AS outbound_calls,
+       COUNT_IF(c.has_callback)                                                    AS callbacks,
+       COUNT_IF(c.direction = 'inbound'  AND c.has_voice AND NOT c.has_callback
+                AND d.conversation_id IS NULL)
+     + COUNT_IF(c.direction = 'outbound' AND c.has_voice AND NOT c.has_callback)
+     + COUNT_IF(c.has_callback)                                                    AS total_contacts
+FROM day_calls c
+CROSS JOIN params p
+LEFT JOIN pci_duplicates d ON d.conversation_id = c.conversation_id
+GROUP BY p.report_date;
+
+
+/* =====================================================================
+   QUERY 2 - Business items 2 and 3: Member / Provider servicing - successful vs dropped
+   ---------------------------------------------------------------------
+-- IT Helpdesk and Web/GCX shown separately (both are "non-provider")
+--we are checking with flow and attributes "QueueMap_Customer, IVR_Option, CallerType, CallerGroup"
+
+--CALLER GROUP--
+--Internal - IT Helpdesk : call went through the IT_Helpdesk flow
+--Provider               : provider marker in participant data
+--                         (QueueMap_Customer > IVR_Option > CallerType > CallerGroup),
+--                         or no marker but went through a provider-only flow
+--                         (H_Provider_IVR, SO_PRS, ES_RX, ES_CPO, ES_PECO, ES_BC_P_PC)
+--Web / GCX              : SO_Web / H_GECX_SelfService flow
+--Member                 : everything else (Steve: "provider, and everything non-provider")
+
+--RESULT--
+--Dropped_Disconnected : A+B+C
+--A. Dropped, short call: the caller hung up within the first 5 seconds, for example during the welcome message or after a wrong dial.
+--B. Dropped, gave up waiting: the caller was on hold for an agent and hung up before anyone answered.
+--C. Dropped, technical problem: the call was cut off by a system fault.
+--Successful : calls received - dropped (served by an agent, ended normally in the IVR, voicemail, transferred out)
+--info_short_under_3s            : old 3-second short-call rule, for comparison only
+--info_classified_without_marker : calls with no member/provider participant data (grouped by flow / default rule)
+   ===================================================================== */
+
+WITH params AS (
+  SELECT DATEADD(day, -1, CONVERT_TIMEZONE('America/New_York', CURRENT_TIMESTAMP())::date) AS report_date
+),
+conv AS ( -- one row per conversation
+  SELECT s.conversation_id,
+         MIN(s.conversation_start)                                           AS conv_start,
+         MAX(s.segment_end)                                                  AS conv_end,
+         MAX(LOWER(s.originating_direction))                                 AS direction,
+         COUNT_IF(LOWER(s.media_type) = 'voice')    > 0                      AS has_voice,
+         COUNT_IF(LOWER(s.media_type) = 'callback') > 0                      AS has_callback,
+         MAX(IFF(LOWER(s.purpose) IN ('customer', 'external'), s.ani, NULL)) AS caller_ani,
+         COUNT_IF(s.flow_name = 'PCI_PAL_Outbound') > 0                      AS is_pci_leg1,
+         COUNT_IF(s.flow_name = 'PCI_PAL_Inbound')  > 0                      AS is_pci_leg2,
+         COUNT_IF(STARTSWITH(LOWER(s.flow_name), 'test_')) > 0               AS is_test,
+         COUNT_IF(s.flow_name IN ('H_Provider_IVR', 'SO_PRS', 'ES_RX',
+                                  'ES_CPO', 'ES_PECO', 'ES_BC_P_PC')) > 0    AS touched_provider_flow,
+         COUNT_IF(s.flow_name = 'IT_Helpdesk') > 0                           AS touched_it_helpdesk,
+         COUNT_IF(s.flow_name IN ('SO_Web', 'H_GECX_SelfService')) > 0       AS touched_web_gcx,
+         COUNT_IF(LOWER(s.purpose) = 'agent') > 0                            AS reached_agent,
+         MAX_BY(LOWER(s.purpose), IFF(LOWER(s.purpose) NOT IN ('customer', 'external'),
+                                      s.segment_end, NULL))                  AS ended_in,
+         MAX_BY(LOWER(s.disconnect_type), IFF(LOWER(s.purpose) IN ('customer', 'external'),
+                                              s.segment_end, NULL))          AS caller_disconnect
+  FROM A3S_GCD.PUBLIC.CONVERSATIONS_SEGMENT_FACT s
+  CROSS JOIN params p
+  WHERE CONVERT_TIMEZONE('UTC', 'America/New_York', s.conversation_start)::date
+        BETWEEN p.report_date AND DATEADD(day, 1, p.report_date)
+  GROUP BY s.conversation_id
+),
+day_calls AS (
+  SELECT c.*
+  FROM conv c
+  CROSS JOIN params p
+  WHERE CONVERT_TIMEZONE('UTC', 'America/New_York', c.conv_start)::date = p.report_date
+    AND NOT c.is_test
+),
+pci_duplicates AS (
+  SELECT DISTINCT l1.conversation_id
+  FROM day_calls l1
+  JOIN conv l2
+    ON  l2.is_pci_leg2
+    AND l2.direction  = 'inbound'
+    AND l2.caller_ani = l1.caller_ani
+    AND (   l2.conv_start BETWEEN l1.conv_start AND DATEADD(minute, 2, l1.conv_start)
+         OR l2.conv_start BETWEEN l1.conv_start AND l1.conv_end)
+  WHERE l1.is_pci_leg1
+    AND l1.direction = 'inbound'
+),
+received AS ( -- business item 1 base: inbound calls received
+  SELECT c.*
+  FROM day_calls c
+  LEFT JOIN pci_duplicates d ON d.conversation_id = c.conversation_id
+  WHERE c.direction = 'inbound'
+    AND c.has_voice
+    AND NOT c.has_callback
+    AND d.conversation_id IS NULL
+),
+marker AS ( -- member/provider participant data
+  SELECT a.conversation_id,
+         MAX(IFF(LOWER(a.keyname) = 'queuemap_customer', LOWER(a.value), NULL)) AS qm,
+         MAX(IFF(LOWER(a.keyname) = 'ivr_option',        LOWER(a.value), NULL)) AS ivr_option,
+         MAX(IFF(LOWER(a.keyname) = 'callertype',        LOWER(a.value), NULL)) AS caller_type,
+         MAX(IFF(LOWER(a.keyname) = 'callergroup',       LOWER(a.value), NULL)) AS caller_group
+  FROM attributes a
+  JOIN received r ON r.conversation_id = a.conversation_id
+  CROSS JOIN params p
+  WHERE CONVERT_TIMEZONE('UTC', 'America/New_York',
+          TO_TIMESTAMP_NTZ(a.start_date_time_key))::date
+        BETWEEN p.report_date AND DATEADD(day, 1, p.report_date)
+    AND LOWER(a.keyname) IN ('queuemap_customer', 'ivr_option', 'callertype', 'callergroup')
+    AND LOWER(a.value) IN ('member', 'provider')
+  GROUP BY a.conversation_id
+),
+classified AS ( -- caller group + dropped flags per call
+  SELECT r.conversation_id,
+         CASE
+           WHEN r.touched_it_helpdesk                                                   THEN 'Internal - IT Helpdesk'
+           WHEN COALESCE(m.qm, m.ivr_option, m.caller_type, m.caller_group) = 'provider' THEN 'Provider'
+           WHEN r.touched_web_gcx                                                       THEN 'Web / GCX'
+           WHEN COALESCE(m.qm, m.ivr_option, m.caller_type, m.caller_group) IS NULL
+                AND r.touched_provider_flow                                            THEN 'Provider'
+           ELSE 'Member'
+         END                                                                   AS member_provider,
+         COALESCE(m.qm, m.ivr_option, m.caller_type, m.caller_group) IS NULL   AS no_marker,
+         DATEDIFF(second, r.conv_start, r.conv_end)                            AS duration_sec,
+         COALESCE(DATEDIFF(second, r.conv_start, r.conv_end) < 5, FALSE)       AS is_short,
+         COALESCE(r.ended_in = 'acd' AND NOT r.reached_agent, FALSE)           AS is_abandoned,
+         COALESCE(r.caller_disconnect = 'error', FALSE)                        AS is_error
+  FROM received r
+  LEFT JOIN marker m ON m.conversation_id = r.conversation_id
+),
+flagged AS (
+  SELECT c.*,
+         (is_short OR is_abandoned OR is_error) AS is_dropped
+  FROM classified c
+)
+SELECT p.report_date,
+       COALESCE(f.member_provider, 'Total')                               AS caller_group,
+       COUNT(*)                                                           AS calls_received,
+       COUNT_IF(NOT f.is_dropped)                                         AS successful,
+       COUNT_IF(f.is_dropped)                                             AS dropped_disconnected,
+       COUNT_IF(f.is_short)                                               AS dropped_short_under_5s,
+       COUNT_IF(f.is_abandoned AND NOT f.is_short)                        AS dropped_abandoned_in_queue,
+       COUNT_IF(f.is_error AND NOT f.is_short AND NOT f.is_abandoned)     AS dropped_system_error,
+       COUNT_IF(f.duration_sec < 3)                                       AS info_short_under_3s,
+       COUNT_IF(f.no_marker)                                              AS info_classified_without_marker
+FROM flagged f
+CROSS JOIN params p
+GROUP BY GROUPING SETS ((p.report_date, f.member_provider), (p.report_date))
+ORDER BY GROUPING(f.member_provider), f.member_provider;
+
+
+/* =====================================================================
+   QUERY 3 - Business item 4: Calls routed to GDF IVR - Member IVR / Provider IVR
+   ---------------------------------------------------------------------
+-- Web/GCX shown separately (SO Web Member AI route, as Sreeni suggested)
+--we are checking with flow "H_Member_IVR, H_Provider_IVR" and attributes
+--"DialogFlowInputVariables, Intent_IVR, ProviderIntent, IsRoutingOverrideFound"
+
+--RESULT--
+--Routed to GDF IVR : 1+2+3
+--1. GDF - Member IVR: the caller went into the member automated menu and was handled by the GDF IVR (talked to the Google bot, or was routed by an IVR routing override).
+--2. GDF - Provider IVR: the caller went into the provider automated menu and was handled by the GDF IVR (talked to the Google bot, or was routed by an IVR routing override).
+--3. GDF - Both: the caller started in one menu, was moved to the other, and was handled by the GDF IVR.
+--4. Web / GCX: the call came through the web member AI (GCX) route, reported separately.
+--5. Ended before the bot: the caller entered the menu but hung up, or the call ended, before the bot started.
+--6. Not routed to GDF: the call never went into the member or provider menu (e.g. IT Helpdesk, other business lines).
+--7. Total: equals calls received (business item 1).
+--Note: IVR routing override calls (e.g. dental/vision providers sent straight to the right team) are counted in 1/2/3 as per business ask.
+   ===================================================================== */
+
+WITH params AS (
+  SELECT DATEADD(day, -1, CONVERT_TIMEZONE('America/New_York', CURRENT_TIMESTAMP())::date) AS report_date
+),
+conv AS ( -- one row per conversation
+  SELECT s.conversation_id,
+         MIN(s.conversation_start)                                           AS conv_start,
+         MAX(s.segment_end)                                                  AS conv_end,
+         MAX(LOWER(s.originating_direction))                                 AS direction,
+         COUNT_IF(LOWER(s.media_type) = 'voice')    > 0                      AS has_voice,
+         COUNT_IF(LOWER(s.media_type) = 'callback') > 0                      AS has_callback,
+         MAX(IFF(LOWER(s.purpose) IN ('customer', 'external'), s.ani, NULL)) AS caller_ani,
+         COUNT_IF(s.flow_name = 'PCI_PAL_Outbound') > 0                      AS is_pci_leg1,
+         COUNT_IF(s.flow_name = 'PCI_PAL_Inbound')  > 0                      AS is_pci_leg2,
+         COUNT_IF(STARTSWITH(LOWER(s.flow_name), 'test_')) > 0               AS is_test,
+         COUNT_IF(s.flow_name = 'H_Member_IVR')   > 0                        AS touched_member_ivr,
+         COUNT_IF(s.flow_name = 'H_Provider_IVR') > 0                        AS touched_provider_ivr,
+         COUNT_IF(s.flow_name IN ('SO_Web', 'H_GECX_SelfService')) > 0       AS touched_web_gcx
+  FROM A3S_GCD.PUBLIC.CONVERSATIONS_SEGMENT_FACT s
+  CROSS JOIN params p
+  WHERE CONVERT_TIMEZONE('UTC', 'America/New_York', s.conversation_start)::date
+        BETWEEN p.report_date AND DATEADD(day, 1, p.report_date)
+  GROUP BY s.conversation_id
+),
+day_calls AS ( -- calls that started on the report day, no test calls
+  SELECT c.*
+  FROM conv c
+  CROSS JOIN params p
+  WHERE CONVERT_TIMEZONE('UTC', 'America/New_York', c.conv_start)::date = p.report_date
+    AND NOT c.is_test
+),
+pci_duplicates AS ( -- PCI Pal leg 1 whose return leg came back
+  SELECT DISTINCT l1.conversation_id
+  FROM day_calls l1
+  JOIN conv l2
+    ON  l2.is_pci_leg2
+    AND l2.direction  = 'inbound'
+    AND l2.caller_ani = l1.caller_ani
+    AND (   l2.conv_start BETWEEN l1.conv_start AND DATEADD(minute, 2, l1.conv_start)
+         OR l2.conv_start BETWEEN l1.conv_start AND l1.conv_end)
+  WHERE l1.is_pci_leg1
+    AND l1.direction = 'inbound'
+),
+received AS ( -- calls received (business item 1 base)
+  SELECT c.*
+  FROM day_calls c
+  LEFT JOIN pci_duplicates d ON d.conversation_id = c.conversation_id
+  WHERE c.direction = 'inbound'
+    AND c.has_voice
+    AND NOT c.has_callback
+    AND d.conversation_id IS NULL
+),
+attr AS ( -- handled by GDF IVR: reached the bot OR IVR routing override
+  SELECT a.conversation_id,
+         COUNT_IF(a.keyname IN ('DialogFlowInputVariables', 'Intent_IVR', 'ProviderIntent')) > 0
+         OR COALESCE(MAX(IFF(a.keyname = 'IsRoutingOverrideFound', LOWER(a.value), NULL)) = 'true',
+                     FALSE)                                                                    AS handled_by_gdf
+  FROM attributes a
+  JOIN received r ON r.conversation_id = a.conversation_id
+  CROSS JOIN params p
+  WHERE CONVERT_TIMEZONE('UTC', 'America/New_York',
+          TO_TIMESTAMP_NTZ(a.start_date_time_key))::date
+        BETWEEN p.report_date AND DATEADD(day, 1, p.report_date)
+    AND a.keyname IN ('DialogFlowInputVariables', 'Intent_IVR', 'ProviderIntent', 'IsRoutingOverrideFound')
+  GROUP BY a.conversation_id
+),
+routed AS ( -- which IVR route each call took
+  SELECT r.conversation_id,
+         CASE
+           WHEN COALESCE(x.handled_by_gdf, FALSE)
+                AND r.touched_member_ivr AND r.touched_provider_ivr         THEN '3. GDF - Both Member and Provider IVR'
+           WHEN COALESCE(x.handled_by_gdf, FALSE) AND r.touched_member_ivr   THEN '1. GDF - Member IVR'
+           WHEN COALESCE(x.handled_by_gdf, FALSE) AND r.touched_provider_ivr THEN '2. GDF - Provider IVR'
+           WHEN r.touched_web_gcx                                            THEN '4. Web / GCX'
+           WHEN r.touched_member_ivr OR r.touched_provider_ivr               THEN '5. Entered IVR, ended before GDF'
+           ELSE                                                                   '6. Not routed to GDF IVR'
+         END AS ivr_route
+  FROM received r
+  LEFT JOIN attr x ON x.conversation_id = r.conversation_id
+),
+route_counts AS (
+  SELECT ivr_route, COUNT(*) AS calls
+  FROM routed
+  GROUP BY ivr_route
+)
+SELECT p.report_date,
+       r.ivr_route,
+       r.calls,
+       ROUND(100 * r.calls / SUM(r.calls) OVER (), 1) AS pct_of_calls_received
+FROM route_counts r
+CROSS JOIN params p
+UNION ALL
+SELECT p.report_date, '7. Total (= calls received)', SUM(r.calls), 100
+FROM route_counts r
+CROSS JOIN params p
+GROUP BY p.report_date
+ORDER BY 2;
+
+
+/* =====================================================================
+   OPEN POINTS (for Sreeni / Steve)
+   1. PCI Pal duplicate rule - confirm; does PCI Pal pass back an ID linking both legs?
+   2. Callbacks - keep separate from calls received?
+   3. Member/Provider marker - is QueueMap_Customer the official one?
+   4. IT Helpdesk and Web/GCX - separate lines or add into Member?
+   5. Short-call threshold - 5 sec (Sreeni) or 3 sec (old rule)?
+   6. Calls through both IVRs - separate line, count in both, or last IVR only?
+   7. A3S load time for the previous day - sets the e-mail send time.
+   Next: business item 5 (contained in IVR - IsContained) and item 6 (escalated to agent).
+   ===================================================================== */
 
